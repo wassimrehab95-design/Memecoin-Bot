@@ -1,248 +1,191 @@
 import os
 import time
+import sqlite3
 import requests
-from datetime import datetime
-import json
+from datetime import datetime, timezone
 
-# Configuration
-TELEGRAM_BOT_TOKEN = "8227029373:AAEnwpYSEl2gf6_KFhNYkXwqoebfp5J97ho"
-TELEGRAM_CHAT_ID = "@QuantBotV2"
-DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/tokens/"
+# =============== CONFIG ===============
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Filters (easily adjustable) - TESTING MODE: VERY LAX
-MIN_MARKET_CAP = 1000       # $1K (very low for testing)
-MAX_MARKET_CAP = 50000000   # $50M (very high for testing)
-MIN_VOLUME = 1000           # $1K (very low for testing)
-MAX_TOKEN_AGE_MINUTES = 999999  # No age limit for testing
+# DexScreener endpoints (documented)
+TOKEN_PROFILES_LATEST = "https://api.dexscreener.com/token-profiles/latest/v1"
+TOKEN_BOOSTS_LATEST = "https://api.dexscreener.com/token-boosts/latest/v1"
+TOKEN_PAIRS = "https://api.dexscreener.com/token-pairs/v1/solana/{}"
 
-# Track sent tokens to avoid duplicates
-sent_tokens = set()
-token_call_times = {}
+SCAN_EVERY_SECONDS = 10
 
-def send_telegram_message(message):
+# Your filters
+MIN_CAP = 20_000
+MAX_CAP = 40_000
+MIN_VOL_24H = 20_000
+MAX_AGE_MINUTES = 20
+MIN_LIQUIDITY_USD = 2_000  # helps avoid total junk pools
+
+# Spam control
+MAX_POSTS_PER_SCAN = 3
+TELEGRAM_COOLDOWN_SECONDS = 4
+
+# Source restriction
+ALLOW_PUMPFUN = True
+ALLOW_BONK_LAUNCHLAB = False  # set True if you *also* want LaunchLab BONK stuff
+
+# Dex IDs on DexScreener UI you may see include "pumpswap", "pumpfun", "launchlab", "raydium", etc.
+ALLOWED_DEX_IDS = set()
+if ALLOW_PUMPFUN:
+    ALLOWED_DEX_IDS.update({"pumpswap", "pumpfun"})
+if ALLOW_BONK_LAUNCHLAB:
+    ALLOWED_DEX_IDS.add("launchlab")
+
+DB_PATH = "sent_tokens.sqlite3"
+
+# =============== HTTP SESSION ===============
+session = requests.Session()
+session.headers.update({"User-Agent": "QuantBotV2/1.0"})
+
+def must_env(name: str, value: str):
+    if not value:
+        raise SystemExit(f"Missing required env var: {name}")
+
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sent (
+            token_address TEXT PRIMARY KEY,
+            sent_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+def already_sent(conn, token_address: str) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM sent WHERE token_address = ? LIMIT 1", (token_address,))
+    return cur.fetchone() is not None
+
+def mark_sent(conn, token_address: str):
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO sent(token_address, sent_at_utc) VALUES(?, ?)",
+        (token_address, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+def send_telegram_message(text: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {
+    payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
+        "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "disable_web_page_preview": False,
     }
-    try:
-        response = requests.post(url, data=data)
-        return response.json()
-    except Exception as e:
-        print(f"Error sending message: {e}")
+    r = session.post(url, data=payload, timeout=15)
+    data = r.json()
+    return bool(data.get("ok"))
+
+def safe_get_json(url: str, timeout=15):
+    r = session.get(url, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+def now_ts_ms() -> int:
+    return int(time.time() * 1000)
+
+def minutes_old_from_pair(pair: dict):
+    ts = pair.get("pairCreatedAt")
+    if not ts:
+        return None
+    # pairCreatedAt is ms since epoch
+    age_ms = now_ts_ms() - int(ts)
+    return int(age_ms / 60000)
+
+def pick_best_allowed_pair(pairs: list[dict]) -> dict | None:
+    """Pick the most useful pool among allowed DEX ids (prefer highest liquidity)."""
+    allowed = []
+    for p in pairs:
+        if p.get("chainId") != "solana":
+            continue
+        dex_id = (p.get("dexId") or "").lower()
+        if dex_id in ALLOWED_DEX_IDS:
+            allowed.append(p)
+
+    if not allowed:
         return None
 
-def get_solana_tokens():
-    """Fetch Solana tokens from multiple DexScreener endpoints"""
-    all_pairs = []
-    
-    try:
-        # Source 1: Latest boosted tokens (newly promoted)
-        print("   Fetching boosted tokens...")
-        boosted_url = "https://api.dexscreener.com/token-boosts/latest/v1"
-        boosted_response = requests.get(boosted_url, timeout=10)
-        if boosted_response.status_code == 200:
-            boosted_data = boosted_response.json()
-            for item in boosted_data:
-                token_address = item.get('tokenAddress')
-                if token_address:
-                    # Fetch pair data for this token
-                    pair_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
-                    pair_response = requests.get(pair_url, timeout=10)
-                    if pair_response.status_code == 200:
-                        pair_data = pair_response.json()
-                        pairs = pair_data.get('pairs', [])
-                        all_pairs.extend([p for p in pairs if p.get('chainId') == 'solana'])
-    except Exception as e:
-        print(f"   Error fetching boosted: {e}")
-    
-    try:
-        # Source 2: Search for recently created Solana pairs
-        print("   Fetching search results...")
-        search_terms = ['solana', 'sol', 'pump', 'moon']
-        for term in search_terms:
-            search_url = f"https://api.dexscreener.com/latest/dex/search?q={term}"
-            search_response = requests.get(search_url, timeout=10)
-            if search_response.status_code == 200:
-                search_data = search_response.json()
-                pairs = search_data.get('pairs', [])
-                all_pairs.extend([p for p in pairs if p.get('chainId') == 'solana'])
-            time.sleep(0.5)  # Rate limit protection
-    except Exception as e:
-        print(f"   Error fetching search: {e}")
-    
-    # Remove duplicates based on token address
-    seen = set()
-    unique_pairs = []
-    for pair in all_pairs:
-        token_addr = pair.get('baseToken', {}).get('address')
-        if token_addr and token_addr not in seen:
-            seen.add(token_addr)
-            unique_pairs.append(pair)
-    
-    return unique_pairs
+    def liq(p):
+        return float((p.get("liquidity") or {}).get("usd") or 0.0)
 
-def format_number(num):
-    if num is None:
+    allowed.sort(key=liq, reverse=True)
+    return allowed[0]
+
+def format_usd(x):
+    try:
+        x = float(x)
+    except Exception:
         return "N/A"
-    num = float(num)
-    if num >= 1000000000:
-        return f"${num/1000000000:.2f}B"
-    elif num >= 1000000:
-        return f"${num/1000000:.2f}M"
-    elif num >= 1000:
-        return f"${num/1000:.2f}K"
-    else:
-        return f"${num:.2f}"
+    if x >= 1_000_000_000:
+        return f"${x/1_000_000_000:.2f}B"
+    if x >= 1_000_000:
+        return f"${x/1_000_000:.2f}M"
+    if x >= 1_000:
+        return f"${x/1_000:.2f}K"
+    return f"${x:.2f}"
 
-def calculate_top_holders_percentage(token_address):
-    try:
-        helius_api_key = "836a3dc9-c051-4074-97a3-36098cd59efe"
-        url = f"https://api.helius.xyz/v0/token-metadata?api-key={helius_api_key}"
-        return "N/A"
-    except:
-        return "N/A"
+def candidate_token_addresses() -> set[str]:
+    addrs = set()
 
-def get_minutes_ago(token_address):
-    if token_address in token_call_times:
-        time_diff = datetime.now() - token_call_times[token_address]
-        return int(time_diff.total_seconds() / 60)
-    return 0
+    # Latest token profiles
+    profiles = safe_get_json(TOKEN_PROFILES_LATEST, timeout=15)
+    if isinstance(profiles, list):
+        for item in profiles:
+            if (item.get("chainId") == "solana") and item.get("tokenAddress"):
+                addrs.add(item["tokenAddress"])
 
-def get_token_age_minutes(pair):
-    """Calculate how old the token is based on pairCreatedAt"""
-    try:
-        pair_created = pair.get('pairCreatedAt')
-        if pair_created:
-            created_time = datetime.fromtimestamp(pair_created / 1000)
-            age = datetime.now() - created_time
-            return int(age.total_seconds() / 60)
-        return None
-    except:
-        return None
+    # Latest boosted tokens
+    boosts = safe_get_json(TOKEN_BOOSTS_LATEST, timeout=15)
+    if isinstance(boosts, list):
+        for item in boosts:
+            if item.get("tokenAddress"):
+                addrs.add(item["tokenAddress"])
 
-def check_and_post_token(pair):
-    try:
-        token_address = pair.get('baseToken', {}).get('address')
-        token_name = pair.get('baseToken', {}).get('name', 'Unknown')
-        token_symbol = pair.get('baseToken', {}).get('symbol', 'Unknown')
-        
-        if not token_address:
-            return
-        
-        if token_address in sent_tokens:
-            return
-        
-        fdv = pair.get('fdv')
-        volume_24h = pair.get('volume', {}).get('h24')
-        liquidity = pair.get('liquidity', {}).get('usd', 0)
-        
-        if pair.get('chainId') != 'solana':
-            return
-        
-        if fdv is None or volume_24h is None:
-            return
-            
-        fdv = float(fdv)
-        volume_24h = float(volume_24h)
-        
-        # Check market cap range: $20K - $40K
-        if fdv < MIN_MARKET_CAP:
-            return
-        if fdv > MAX_MARKET_CAP:
-            return
-        
-        # Check volume
-        if volume_24h < MIN_VOLUME:
-            return
-        
-        # Check token age (must be younger than 20 minutes)
-        token_age = get_token_age_minutes(pair)
-        if token_age is not None and token_age > MAX_TOKEN_AGE_MINUTES:
-            return
-        
-        if token_address not in token_call_times:
-            token_call_times[token_address] = datetime.now()
-        
-        mins_ago = get_minutes_ago(token_address)
-        top_10_holders = calculate_top_holders_percentage(token_address)
-        
-        mins_text = "min" if mins_ago == 1 else "mins"
-        age_text = f"{token_age} mins old" if token_age else "New"
-        
-        message = f"""🚀 <b>{token_name}</b> ({token_symbol})
+    return addrs
 
-💊 <code>{token_address}</code>
+def passes_filters(pair: dict) -> tuple[bool, str]:
+    # cap: prefer marketCap, fallback to fdv
+    mcap = pair.get("marketCap")
+    fdv = pair.get("fdv")
+    cap_value = mcap if mcap is not None else fdv
+    cap_label = "Mkt Cap" if mcap is not None else "FDV"
+    if cap_value is None:
+        return False, "no cap"
 
-📈 <a href="https://axiom.trade/t/{token_address}">Chart Watch: AXIOM</a>
-💰 Market Cap: {format_number(fdv)}
-🏛 Top 10 Holders: {top_10_holders}%
-📊 Volume (24h): {format_number(volume_24h)}
-⏰ Called: {mins_ago} {mins_text} ago
-🕐 Token Age: {age_text}
+    cap_value = float(cap_value)
+    if cap_value < MIN_CAP or cap_value > MAX_CAP:
+        return False, f"cap out of range ({cap_label}={cap_value})"
 
-<a href="https://dexscreener.com/solana/{token_address}">View on DexScreener</a>
-"""
-        
-        result = send_telegram_message(message)
-        
-        if result and result.get('ok'):
-            sent_tokens.add(token_address)
-            print(f"✅ Posted: {token_name} ({token_symbol})")
-            print(f"   MC: {format_number(fdv)} | Vol: {format_number(volume_24h)} | Age: {age_text}")
-        else:
-            print(f"❌ Failed to post: {token_name}")
-            
-    except Exception as e:
-        print(f"Error processing token: {e}")
+    vol24 = (pair.get("volume") or {}).get("h24")
+    if vol24 is None:
+        return False, "no volume"
+    vol24 = float(vol24)
+    if vol24 < MIN_VOL_24H:
+        return False, "volume too low"
 
-def main():
-    print("🤖 Solana Memecoin Bot Starting...")
-    print(f"📊 Filters:")
-    print(f"   • Market Cap: ${MIN_MARKET_CAP:,} - ${MAX_MARKET_CAP:,}")
-    print(f"   • Volume: > ${MIN_VOLUME:,}")
-    print(f"   • Token Age: < {MAX_TOKEN_AGE_MINUTES} minutes")
-    print(f"📱 Posting to: {TELEGRAM_CHAT_ID}")
-    print("=" * 50)
-    
-    startup_msg = f"""🤖 <b>Memecoin Bot Online - TESTING MODE</b>
+    liq = float((pair.get("liquidity") or {}).get("usd") or 0.0)
+    if liq < MIN_LIQUIDITY_USD:
+        return False, "liquidity too low"
 
-✅ Bot is now monitoring Solana tokens
-📊 Active Filters (LAX FOR TESTING):
-• Market Cap: ${MIN_MARKET_CAP:,} - ${MAX_MARKET_CAP:,}
-• Volume: > ${MIN_VOLUME:,}
-• Token Age: No limit
+    age_min = minutes_old_from_pair(pair)
+    if age_min is None:
+        return False, "no pairCreatedAt"
+    if age_min > MAX_AGE_MINUTES:
+        return False, "too old"
 
-🔍 Scanning every 10 seconds...
-⚠️ TESTING MODE - Will post many tokens!
-"""
-    send_telegram_message(startup_msg)
-    
-    check_count = 0
-    
-    while True:
-        try:
-            check_count += 1
-            print(f"\n🔍 Check #{check_count} - {datetime.now().strftime('%H:%M:%S')}")
-            
-            pairs = get_solana_tokens()
-            print(f"   Found {len(pairs)} pairs")
-            
-            for pair in pairs:
-                check_and_post_token(pair)
-            
-            print(f"   Total posted: {len(sent_tokens)}")
-            
-            time.sleep(10)
-            
-        except KeyboardInterrupt:
-            print("\n\n👋 Bot stopped by user")
-            break
-        except Exception as e:
-            print(f"❌ Error in main loop: {e}")
-            time.sleep(30)
+    return True, ""
 
-if __name__ == "__main__":
-    main()
+def build_message(pair: dict) -> str:
+    base = pa
+
