@@ -9,11 +9,11 @@ TELEGRAM_BOT_TOKEN = "8227029373:AAEnwpYSEl2gf6_KFhNYkXwqoebfp5J97ho"
 TELEGRAM_CHAT_ID = "@QuantBotV2"
 DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/tokens/"
 
-# Filters (easily adjustable)
-MIN_MARKET_CAP = 20000      # $20K
-MAX_MARKET_CAP = 40000      # $40K (changed from 20M)
-MIN_VOLUME = 20000          # $20K
-MAX_TOKEN_AGE_MINUTES = 20  # Only tokens younger than 20 minutes
+# Filters (easily adjustable) - TESTING MODE: VERY LAX
+MIN_MARKET_CAP = 1000       # $1K (very low for testing)
+MAX_MARKET_CAP = 50000000   # $50M (very high for testing)
+MIN_VOLUME = 1000           # $1K (very low for testing)
+MAX_TOKEN_AGE_MINUTES = 999999  # No age limit for testing
 
 # Track sent tokens to avoid duplicates
 sent_tokens = set()
@@ -169,15 +169,16 @@ def main():
     print(f"📱 Posting to: {TELEGRAM_CHAT_ID}")
     print("=" * 50)
     
-    startup_msg = f"""🤖 <b>Memecoin Bot Online</b>
+    startup_msg = f"""🤖 <b>Memecoin Bot Online - TESTING MODE</b>
 
 ✅ Bot is now monitoring Solana tokens
-📊 Active Filters:
+📊 Active Filters (LAX FOR TESTING):
 • Market Cap: ${MIN_MARKET_CAP:,} - ${MAX_MARKET_CAP:,}
 • Volume: > ${MIN_VOLUME:,}
-• Token Age: < {MAX_TOKEN_AGE_MINUTES} minutes old
+• Token Age: No limit
 
 🔍 Scanning every 10 seconds...
+⚠️ TESTING MODE - Will post many tokens!
 """
     send_telegram_message(startup_msg)
     
@@ -207,3 +208,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
