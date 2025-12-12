@@ -35,16 +35,54 @@ def send_telegram_message(message):
         return None
 
 def get_solana_tokens():
+    """Fetch Solana tokens from multiple DexScreener endpoints"""
+    all_pairs = []
+    
     try:
-        url = "https://api.dexscreener.com/latest/dex/search?q=solana"
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get('pairs', [])
-        return []
+        # Source 1: Latest boosted tokens (newly promoted)
+        print("   Fetching boosted tokens...")
+        boosted_url = "https://api.dexscreener.com/token-boosts/latest/v1"
+        boosted_response = requests.get(boosted_url, timeout=10)
+        if boosted_response.status_code == 200:
+            boosted_data = boosted_response.json()
+            for item in boosted_data:
+                token_address = item.get('tokenAddress')
+                if token_address:
+                    # Fetch pair data for this token
+                    pair_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+                    pair_response = requests.get(pair_url, timeout=10)
+                    if pair_response.status_code == 200:
+                        pair_data = pair_response.json()
+                        pairs = pair_data.get('pairs', [])
+                        all_pairs.extend([p for p in pairs if p.get('chainId') == 'solana'])
     except Exception as e:
-        print(f"Error fetching tokens: {e}")
-        return []
+        print(f"   Error fetching boosted: {e}")
+    
+    try:
+        # Source 2: Search for recently created Solana pairs
+        print("   Fetching search results...")
+        search_terms = ['solana', 'sol', 'pump', 'moon']
+        for term in search_terms:
+            search_url = f"https://api.dexscreener.com/latest/dex/search?q={term}"
+            search_response = requests.get(search_url, timeout=10)
+            if search_response.status_code == 200:
+                search_data = search_response.json()
+                pairs = search_data.get('pairs', [])
+                all_pairs.extend([p for p in pairs if p.get('chainId') == 'solana'])
+            time.sleep(0.5)  # Rate limit protection
+    except Exception as e:
+        print(f"   Error fetching search: {e}")
+    
+    # Remove duplicates based on token address
+    seen = set()
+    unique_pairs = []
+    for pair in all_pairs:
+        token_addr = pair.get('baseToken', {}).get('address')
+        if token_addr and token_addr not in seen:
+            seen.add(token_addr)
+            unique_pairs.append(pair)
+    
+    return unique_pairs
 
 def format_number(num):
     if num is None:
@@ -208,4 +246,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
